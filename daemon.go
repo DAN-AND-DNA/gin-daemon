@@ -1,19 +1,56 @@
 package gin_daemon
 
-import "github.com/gin-gonic/gin"
+import (
+	"github.com/docker/docker/pkg/reexec"
+	"github.com/gin-gonic/gin"
+	"sync"
+)
 
-func GinDaemon() gin.HandlerFunc {
+func init() {
+	runner := NewRunner()
+	reexec.Register("RunAsWorker", runner.RunAsWorker)
+}
+
+// Runner process
+type Runner struct {
+	once sync.Once
+}
+
+func NewRunner() *Runner {
+	d := &Runner{}
+	return d
+}
+
+func (runner *Runner) RunAsMaster() {
+	cmd := reexec.Command("RunAsWorker")
+	cmd.Start()
+	cmd.Wait()
+
+	//TODO listen unix http
+}
+
+func (runner *Runner) RunAsWorker() {
+	// TODO get metadata from master
+}
+
+func GinDaemon(master *Runner) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		/* TODO
 		xx/run 启动子进程
 		xx/stop 停止父进程，子进程的心跳根据父进程的pid判断，是否要优雅关闭
-		xx/reload 新创建一个子进程，父进程把流量打给新进程，老的子进程优雅关闭
+		xx/reload 新创建一个子进程，父进程把请求打给新进程，老的子进程优雅关闭
 
 		父进程监听http请求
 		子进程监听http请求
 
 		钩子，当子进程成功创建，父进程执行握手的钩子
+		unixTestSocket := filepath.Join(os.TempDir(), "unix_unit_test")
+		defer os.Remove(unixTestSocket)
 
+		r := New()
+		r.RunUnix(unixTestSocket)
+
+		c, err := net.Dial("unix", unixTestSocket)
 		*/
 	}
 }

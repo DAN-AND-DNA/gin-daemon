@@ -1,111 +1,184 @@
 package gin_daemon
 
 import (
+	"context"
 	"github.com/gin-gonic/gin"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
+	"time"
 )
 
 // Daemon process
 type Daemon struct {
-	once       sync.Once
-	unixSocket *os.File
+	lUnix         *net.UnixListener
+	tcpHttpServer *http.Server
+	wg            sync.WaitGroup
+	MsgChan       chan Msg
+	Pid           int
+	PluginPid     int
 }
 
 func NewDaemon() *Daemon {
-	d := &Daemon{}
+	d := &Daemon{
+		MsgChan: make(chan Msg, 100),
+		Pid:     os.Getpid(),
+	}
+
+	d.Poll()
+	lUnix, err := newUnixListener()
+	if err != nil {
+		panic(err)
+	}
+	d.lUnix = lUnix
+
+	r := gin.Default()
+	r.Use(runAsDaemon(d))
+	tcpHttpServer := &http.Server{
+		Addr:    ":3777",
+		Handler: r,
+	}
+	d.tcpHttpServer = tcpHttpServer
+
 	return d
 }
 
-func (d *Daemon) RunAsMaster() error {
-	//TODO listen tcp http for outer
-	//TODO listen unix http for internal
-	unixSocket := filepath.Join(os.TempDir(), "gin-daemon-unix-http.sock")
-	//defer os.Remove(unixSocket)
-
-	r := gin.Default()
-	r.GET("/health_check", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"message": "ok",
-		})
-	})
-
-	r.GET("/stop", func(c *gin.Context) {
-		// TODO
-	})
-
-	r.GET("/run", func(c *gin.Context) {
-		go d.RunPlugin()
-	})
-
-	os.Remove(unixSocket)
-	ua, err := net.ResolveUnixAddr("unix", unixSocket)
+func (d *Daemon) Run() error {
+	err := d.tcpHttpServer.ListenAndServe()
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (d *Daemon) Poll() {
+	go func() {
+		d.wg.Add(1)
+		defer d.wg.Done()
+
+		t1 := time.Tick(1 * time.Second)
+		t3 := time.Tick(3 * time.Second)
+
+		for {
+			select {
+			case msg := <-d.MsgChan:
+				switch msg.Type {
+				case PluginError:
+				case PluginHeartBeat:
+				}
+			case <-t1:
+			case <-t3:
+				d.watchPlugin()
+			}
+		}
+	}()
+}
+
+func (d *Daemon) watchPlugin() {
+	if d.IsPluginRunning() {
+		return
+	}
+
+	err := d.RunPlugin()
+	if err != nil {
+		log.Println(err)
+		return
+	}
+}
+
+func newUnixListener() (*net.UnixListener, error) {
+	unixSocket := filepath.Join(os.TempDir(), "plugin.sock")
+	_ = os.Remove(unixSocket)
+
+	ua, err := net.ResolveUnixAddr("unix", unixSocket)
+	if err != nil {
+		return nil, err
 	}
 
 	l, err := net.ListenUnix("unix", ua)
 	if err != nil {
-		return err
+		return l, err
 	}
-	file, err := l.File()
-	if err != nil {
-		return err
-	}
-	d.unixSocket = file
-	http.Serve(l, r)
 
+	return l, nil
+}
+
+func (d *Daemon) IsPluginRunning() bool {
+	p, err := os.FindProcess(d.PluginPid)
+	if err != nil {
+		err = p.Signal(syscall.Signal(0))
+		return err != nil
+	}
+
+	return false
+}
+
+// StopPlugin shutdown plugin process gracefully
+func (d *Daemon) StopPlugin() error {
 	return nil
 }
 
-func (d *Daemon) StopWorker() {
-
-}
-
+// RunPlugin run new plugin process
 func (d *Daemon) RunPlugin() error {
-	// TODO get metadata from master
+	lFile, err := d.lUnix.File()
+	if err != nil {
+		return err
+	}
+
 	basePath := os.Args[0]
 	cmd := exec.Command(basePath + "/plugin")
-
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	// pass unix server fd
-	cmd.ExtraFiles = []*os.File{d.unixSocket}
+	cmd.ExtraFiles = []*os.File{lFile}
 
-	err := cmd.Start()
+	err = cmd.Start()
 	if err != nil {
 		return err
 	}
 
-	err = cmd.Wait()
-	if err != nil {
-		return err
-	}
+	d.wg.Add(1)
+	defer d.wg.Done()
+
+	go func() {
+		d.wg.Add(1)
+		defer d.wg.Done()
+
+		err = cmd.Wait()
+		if err != nil {
+			d.MsgChan <- Msg{Type: PluginError, Err: err}
+			return
+		}
+	}()
 
 	return nil
 }
 
-func GinPlugin() gin.HandlerFunc {
+func runAsDaemon(d *Daemon) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		/* TODO
-		xx/stop 停止父进程，子进程的心跳根据父进程的pid判断，是否要优雅关闭
-		xx/reload 新创建一个子进程，父进程把请求打给新进程，老的子进程优雅关闭
+		fullPath := c.FullPath()
+		switch fullPath {
+		case "/stop":
+			// TODO
+			d.tcpHttpServer.Shutdown(context.TODO())
 
-		父进程监听http请求
-		子进程监听http请求
+			d.wg.Wait()
 
-		钩子，当子进程成功创建，父进程执行握手的钩子
-		unixTestSocket := filepath.Join(os.TempDir(), "unix_unit_test")
-		defer os.Remove(unixTestSocket)
+		case "/reload":
+			err := d.StopPlugin()
+			if err != nil {
+				log.Println(err)
+			}
 
-		r := New()
-		r.RunUnix(unixTestSocket)
-
-		c, err := net.Dial("unix", unixTestSocket)
-		*/
+			err = d.RunPlugin()
+			if err != nil {
+				log.Println(err)
+			}
+		}
 	}
 }
